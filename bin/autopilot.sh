@@ -70,11 +70,12 @@ Only headings that name a step count — "## Step 4" or "### 7a." — so an
 gate by accident.
 
 Logs: each step's filtered Claude output plus this script's own messages
-(prefixed "AP:") go to logs/autopilot-step-<n>.log; the JSON stream goes to
+(prefixed "AP:") go to logs/autopilot-step-<n>.log, streamed live as the step
+runs — `tail -f` it to watch progress. The JSON stream goes to
 logs/autopilot-step-<n>.raw.jsonl and Claude's stderr to
-logs/autopilot-step-<n>.err. <n> is the next unused number, so no earlier
-log is ever overwritten. The logs directory should be gitignored; the run
-warns if it isn't.
+logs/autopilot-step-<n>.err (both written after the step finishes). <n> is
+the next unused number, so no earlier log is ever overwritten. The logs
+directory should be gitignored; the run warns if it isn't.
 
 The archived .raw.jsonl has the per-token "stream_event" records stripped
 out — they are ~99% of the bytes and their text is already in the .log. The
@@ -613,7 +614,7 @@ fi
 # writes an AP-prefixed line to the current step's log AND the terminal
 ap() {
   if [[ -n "$step_log" ]]; then
-    echo "AP: $(date '+%H:%M:%S') $*" | tee -a "$step_log"
+    echo "AP: $(date '+%Y-%m-%d %H:%M:%S') | $*" | tee -a "$step_log"
   else
     say "$*"
   fi
@@ -740,10 +741,13 @@ while (( steps_run < MAX_STEPS )); do
   # figures out which undone step to work on.
   # shellcheck disable=SC2016  # $1..$9 are the inner shell's positional args,
   # passed after the script string below — expanding them here is exactly wrong.
+  # Text is tee'd live into $step_log (not just the scratch file) as it
+  # streams, so `tail -f logs/autopilot-step-N.log` shows progress during the
+  # step instead of going silent until the whole attempt finishes.
   run_interruptible "${step_timeout[@]}" bash -c '
     set -uo pipefail
-    plan=$1; model=$2; effort=$3; out=$4; err=$5; raw=$6; filter=$7; status=$8
-    shift 8
+    plan=$1; model=$2; effort=$3; out=$4; err=$5; raw=$6; filter=$7; status=$8; log=$9
+    shift 9
     eff=()
     [[ -n "$effort" ]] && eff=(--effort "$effort")
     claude -p "/plan-step-implementer \"$plan\"" \
@@ -756,12 +760,12 @@ while (( steps_run < MAX_STEPS )); do
       "$@" \
       2>>"$err" \
       | tee -a "$raw" \
-      | jq -Rrj -f "$filter" \
-      >> "$out"
+      | jq --unbuffered -Rrj -f "$filter" \
+      | tee -a "$out" >> "$log"
     echo "${PIPESTATUS[0]}" > "$status"
   ' autopilot-attempt \
       "$PLAN_FILE" "$AUTOPILOT_MODEL" "$AUTOPILOT_EFFORT" \
-      "$attempt_text" "$attempt_err" "$attempt_raw" "$text_filter" "$attempt_status" \
+      "$attempt_text" "$attempt_err" "$attempt_raw" "$text_filter" "$attempt_status" "$step_log" \
       "${claude_extra_flags[@]+"${claude_extra_flags[@]}"}"
   wrapper_exit=$?
 
@@ -773,17 +777,19 @@ while (( steps_run < MAX_STEPS )); do
   # No text at all, but a stream that did arrive, means the partial-message
   # events this filter depends on weren't emitted. Recover the same text from
   # the completed assistant messages rather than reporting the step as having
-  # done nothing.
+  # done nothing. Nothing was tee'd live into $step_log in this case (the
+  # normal stream_event-driven tee never fired), so it's appended here.
   if [[ ! -s "$attempt_text" ]] && [[ -s "$attempt_raw" ]]; then
     jq -Rr -f "$whole_text_filter" "$attempt_raw" >> "$attempt_text" 2>/dev/null
     if [[ -s "$attempt_text" ]]; then
       ap "NOTE: no partial-message events in the stream; recovered this step's text from the completed assistant messages. Check whether Claude Code's --include-partial-messages behaviour changed."
+      cat "$attempt_text" >> "$step_log"
     fi
   fi
 
   echo >> "$attempt_text"   # ensure the next AP: line starts on its own line
+  echo >> "$step_log"       # matches, since normal-path text is already there
 
-  cat "$attempt_text" >> "$step_log"
   jq -Rr -f "$archive_filter" "$attempt_raw" >> "$raw_log" 2>/dev/null
   cat "$attempt_err"  >> "$err_log"
 
@@ -795,11 +801,12 @@ while (( steps_run < MAX_STEPS )); do
   saw_review=0
   grep -qE '^[[:space:]]*NO_PENDING_STEPS[[:space:]]*$'      "$attempt_text" && saw_no_pending=1
   grep -qE '^[[:space:]]*HUMAN_REVIEW_REQUIRED[[:space:]]*$' "$attempt_text" && saw_review=1
-  # Anchored to characters git actually allows in a ref, so trailing prose on
-  # the same line ("AUTOPILOT_BRANCH=autopilot/x — created") yields the branch
-  # rather than the branch plus the commentary glued to it, which would then
-  # mismatch the checked-out branch and stop a step that had in fact succeeded.
-  branch_name=$(sed -nE 's|^[[:space:]]*AUTOPILOT_BRANCH=([A-Za-z0-9._/-]+).*|\1|p' \
+  # Anchored to characters git actually allows in a ref, so prose glued to
+  # either side of the sentinel on the same line (the streamed text has no
+  # guaranteed newline before or after it) yields just the branch rather than
+  # failing to match at all, which would then mismatch the checked-out branch
+  # and stop a step that had in fact succeeded.
+  branch_name=$(sed -nE 's|.*AUTOPILOT_BRANCH=([A-Za-z0-9._/-]+).*|\1|p' \
                   "$attempt_text" | tail -n1)
 
   # The provisional step_num above is just an unused-log-slot counter, not
@@ -807,8 +814,13 @@ while (( steps_run < MAX_STEPS )); do
   # AUTOPILOT_STEP=<N> is the skill's ground truth for which heading it
   # picked; once it's seen, rename this step's logs to match so
   # autopilot-step-N.log lines up with '## Step N' in the plan file.
+  # Not anchored to line start/end: the streamed text has no guaranteed
+  # newline around the sentinel, so it can end up glued to the prose before
+  # or after it on the same line (observed: "...directory.AUTOPILOT_STEP=5"),
+  # which a whole-line match would silently miss, leaving the log stuck under
+  # its provisional slot number.
   if (( ! step_num_confirmed )); then
-    reported_step=$(sed -nE 's|^[[:space:]]*AUTOPILOT_STEP=([0-9]+)[[:space:]]*$|\1|p' \
+    reported_step=$(sed -nE 's|.*AUTOPILOT_STEP=([0-9]+).*|\1|p' \
                       "$attempt_text" | tail -n1)
     if [[ -n "$reported_step" ]]; then
       real_num=$reported_step
