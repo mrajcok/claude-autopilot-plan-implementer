@@ -124,7 +124,7 @@ steps complete before the usage window closes.
 | `AUTOPILOT_BRANCH=<name>` | the branch you created for this step |
 | `HUMAN_REVIEW_REQUIRED` | blocked; stopping |
 
-Each is matched as a whole line. Print one alone on its own line, exactly, with
+Print one alone on its own line, exactly, with
 no prose, quotes, or backticks around it — and only when you mean it.
 
 Never put one on a line by itself in any other situation, including inside a

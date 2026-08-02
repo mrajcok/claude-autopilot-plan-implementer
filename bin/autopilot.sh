@@ -228,7 +228,7 @@ AUTOPILOT_MODEL="${AUTOPILOT_MODEL:-sonnet}"
 AUTOPILOT_EFFORT="${AUTOPILOT_EFFORT-medium}"
 AUTOPILOT_FALLBACK_MODEL="${AUTOPILOT_FALLBACK_MODEL:-}"
 AUTOPILOT_MAX_BUDGET_USD="${AUTOPILOT_MAX_BUDGET_USD:-}"
-MAX_STEPS="${MAX_STEPS:-1}"   # safety cap so a bad run can't run forever; increase once we prove out this script and the skill
+MAX_STEPS="${MAX_STEPS:-5}"   # safety cap so a bad run can't run forever; increase once we prove out this script and the skill
 MAX_RUN_SECONDS="${MAX_RUN_SECONDS:-43200}"                     # 12h
 STEP_TIMEOUT_SECONDS="${STEP_TIMEOUT_SECONDS:-3600}"            # 1h
 TEST_TIMEOUT_SECONDS="${TEST_TIMEOUT_SECONDS:-1800}"            # 30m
@@ -451,6 +451,28 @@ finish_reason=""
 stopped_for_review=0
 email_sent=0
 completed_steps=()
+completed_step_nums=()
+
+# Folds a list of step numbers into "5-9" / "5,7-9" style ranges, for the
+# email subject.
+format_step_range() {
+  local sorted start prev n ranges=()
+  mapfile -t sorted < <(printf '%s\n' "$@" | sort -n)
+  start=${sorted[0]}
+  prev=$start
+  for n in "${sorted[@]:1}"; do
+    if (( n == prev + 1 )); then
+      prev=$n
+      continue
+    fi
+    ranges+=("$([[ $start == "$prev" ]] && echo "$start" || echo "$start-$prev")")
+    start=$n
+    prev=$n
+  done
+  ranges+=("$([[ $start == "$prev" ]] && echo "$start" || echo "$start-$prev")")
+  local IFS=,
+  echo "${ranges[*]}"
+}
 
 # Summarize the run and mail it. Called from the exit path and from the signal
 # traps, so it has to be safe to call twice.
@@ -462,7 +484,15 @@ send_run_email() {
   local outcome="$1" elapsed subject body
   elapsed=$(( $(date +%s) - RUN_START ))
 
-  subject="[autopilot] $(basename "$PWD"): ${outcome} — ${steps_run} step(s)"
+  local steps_desc
+  if (( ${#completed_step_nums[@]} == 0 )); then
+    steps_desc="0 steps"
+  elif (( ${#completed_step_nums[@]} == 1 )); then
+    steps_desc="step ${completed_step_nums[0]}"
+  else
+    steps_desc="steps $(format_step_range "${completed_step_nums[@]}")"
+  fi
+  subject="[autopilot] $(basename "$PWD"): ${outcome} — ${steps_desc}"
   {
     echo "Project:   $(basename "$PWD") ($PWD)"
     echo "Plan file: $PLAN_FILE"
@@ -709,7 +739,14 @@ while (( steps_run < MAX_STEPS )); do
   else
     ap "Starting the next step (session will pick the next undone step from $PLAN_FILE and branch off $BASE_BRANCH)"
   fi
-  say "Starting attempt (log: $step_log)"
+  if (( step_num_confirmed )); then
+    say "Starting attempt (log: $step_log)"
+  else
+    # $step_num is only a free-slot counter this early; the log is renamed to
+    # the real plan step number as soon as the skill reports AUTOPILOT_STEP.
+    # Saying so beats printing a number that won't match the final filename.
+    say "Starting attempt (log: $step_log — renamed to the real step number once the session reports it)"
+  fi
 
   # Each attempt writes to its own scratch files — stdout, raw stream *and*
   # stderr — so the checks below only ever see *this* attempt's output. A
@@ -809,6 +846,23 @@ while (( steps_run < MAX_STEPS )); do
   branch_name=$(sed -nE 's|.*AUTOPILOT_BRANCH=([A-Za-z0-9._/-]+).*|\1|p' \
                   "$attempt_text" | tail -n1)
 
+  # That character class can't tell a branch name from the prose glued to its
+  # end when the stream emits no newline after the sentinel — observed:
+  # "...-publisher-registry-badgesGood, that part is..." yielding a branch
+  # ending in "Good". The checked-out branch is ground truth, so when the
+  # extracted name is that branch plus a suffix, trust git and drop the
+  # suffix: otherwise the mismatch check below stops a step that in fact
+  # succeeded. Only ever trims — a genuinely different name still mismatches.
+  reported_branch="$branch_name"
+  actual_now="$(git branch --show-current 2>/dev/null)"
+  if [[ -n "$branch_name" && -n "$actual_now" ]] \
+     && [[ "$actual_now" == autopilot/* ]] \
+     && [[ "$branch_name" != "$actual_now" ]] \
+     && [[ "$branch_name" == "$actual_now"* ]]; then
+    ap "NOTE: the AUTOPILOT_BRANCH line ran into the prose after it ('$reported_branch'); using the checked-out branch '$actual_now'."
+    branch_name="$actual_now"
+  fi
+
   # The provisional step_num above is just an unused-log-slot counter, not
   # the plan's actual step number (see the comment where it's assigned).
   # AUTOPILOT_STEP=<N> is the skill's ground truth for which heading it
@@ -824,14 +878,23 @@ while (( steps_run < MAX_STEPS )); do
                       "$attempt_text" | tail -n1)
     if [[ -n "$reported_step" ]]; then
       real_num=$reported_step
-      while [[ -e "$LOG_DIR/autopilot-step-${real_num}.log" ]] \
-            && [[ "$LOG_DIR/autopilot-step-${real_num}.log" != "$step_log" ]]; do
-        real_num=$((real_num + 1))
-      done
-      if (( real_num != step_num )); then
-        real_log="$LOG_DIR/autopilot-step-${real_num}.log"
-        real_raw="$LOG_DIR/autopilot-step-${real_num}.raw.jsonl"
-        real_err="$LOG_DIR/autopilot-step-${real_num}.err"
+      real_log="$LOG_DIR/autopilot-step-${real_num}.log"
+      real_raw="$LOG_DIR/autopilot-step-${real_num}.raw.jsonl"
+      real_err="$LOG_DIR/autopilot-step-${real_num}.err"
+      # A file already sitting at the real number can only be a stale
+      # provisional log from an earlier attempt at this same step (plan step
+      # numbers are unique) -- one that failed or was killed before reaching
+      # this point, so it never got renamed off its provisional slot. Move it
+      # aside rather than bumping this step's number up past it: bumping
+      # would let every such stale leftover permanently steal a number, and
+      # every later step would drift further from its actual plan heading.
+      if [[ -e "$real_log" ]] && [[ "$real_log" != "$step_log" ]]; then
+        stale_suffix=".stale-$(date -u +%Y%m%dT%H%M%SZ)"
+        mv -f "$real_log" "${real_log}${stale_suffix}"
+        [[ -e "$real_raw" ]] && mv -f "$real_raw" "${real_raw}${stale_suffix}"
+        [[ -e "$real_err" ]] && mv -f "$real_err" "${real_err}${stale_suffix}"
+      fi
+      if [[ "$real_log" != "$step_log" ]]; then
         mv -f "$step_log" "$real_log"
         mv -f "$raw_log" "$real_raw"
         mv -f "$err_log" "$real_err"
@@ -839,6 +902,7 @@ while (( steps_run < MAX_STEPS )); do
         raw_log="$real_raw"
         err_log="$real_err"
         step_num=$real_num
+        ap "This step is plan step $real_num; its logs are now $step_log"
       fi
       step_num_confirmed=1
     fi
@@ -1157,6 +1221,7 @@ while (( steps_run < MAX_STEPS )); do
 
   steps_run=$((steps_run + 1))
   completed_steps+=("$step_name")
+  completed_step_nums+=("$step_num")
   ap "Finished step $step_num: $step_name (merged '$branch_name' into $BASE_BRANCH)"
   say "Finished step $step_num: $step_name"
 done
