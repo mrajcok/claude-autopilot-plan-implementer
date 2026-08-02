@@ -100,7 +100,10 @@ resolve entries already in it.
    made, anything a reviewer should look at twice. Facts only: no restating
    the plan's text, no progress commentary, no previewing what you're about to
    do. Your extended thinking and tool output are stripped from the log; this
-   narration is all that survives.
+   narration is all that survives. This narration streams straight into the
+   run log with no reformatting, so start every separate remark with `- ` on
+   its own line — one bullet per thought, never several run together with no
+   break.
 
 ## Token budget
 
@@ -124,8 +127,11 @@ steps complete before the usage window closes.
 | `AUTOPILOT_BRANCH=<name>` | the branch you created for this step |
 | `HUMAN_REVIEW_REQUIRED` | blocked; stopping |
 
-Print one alone on its own line, exactly, with
-no prose, quotes, or backticks around it — and only when you mean it.
+Print one alone on its own line — a blank line before it and a blank line
+after it, nothing else sharing either of those lines, no prose, quotes, or
+backticks around it — and only when you mean it. If two sentinels both apply
+(e.g. `AUTOPILOT_STEP` then `AUTOPILOT_BRANCH`), put a blank line between
+them too; never emit two back to back with no line break.
 
 Never put one on a line by itself in any other situation, including inside a
 code block, a quote, or an example of what you did. Mentioning one inside a

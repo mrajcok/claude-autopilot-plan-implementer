@@ -881,18 +881,34 @@ while (( steps_run < MAX_STEPS )); do
       real_log="$LOG_DIR/autopilot-step-${real_num}.log"
       real_raw="$LOG_DIR/autopilot-step-${real_num}.raw.jsonl"
       real_err="$LOG_DIR/autopilot-step-${real_num}.err"
-      # A file already sitting at the real number can only be a stale
-      # provisional log from an earlier attempt at this same step (plan step
-      # numbers are unique) -- one that failed or was killed before reaching
-      # this point, so it never got renamed off its provisional slot. Move it
-      # aside rather than bumping this step's number up past it: bumping
-      # would let every such stale leftover permanently steal a number, and
-      # every later step would drift further from its actual plan heading.
+      # A file already sitting at the real number is one of two things, told
+      # apart by whether a heading numbered $real_num was already done
+      # *before* this attempt started: a parent "## Step N" and its
+      # sub-steps "### Na./Nb./..." all report the same bare N (SKILL.md
+      # strips the letter), so a done N-heading means this collision is a
+      # real, already-completed sibling's log -- give this attempt a
+      # suffixed name instead of touching it. Otherwise the existing file is
+      # a stale provisional log from an earlier attempt at this same step
+      # that failed or was killed before reaching this point, so it never
+      # got renamed off its provisional slot -- move it aside. Either way,
+      # never just bump this step's number up past it: that would let stale
+      # leftovers permanently steal numbers, drifting every later step
+      # further from its actual plan heading.
       if [[ -e "$real_log" ]] && [[ "$real_log" != "$step_log" ]]; then
-        stale_suffix=".stale-$(date -u +%Y%m%dT%H%M%SZ)"
-        mv -f "$real_log" "${real_log}${stale_suffix}"
-        [[ -e "$real_raw" ]] && mv -f "$real_raw" "${real_raw}${stale_suffix}"
-        [[ -e "$real_err" ]] && mv -f "$real_err" "${real_err}${stale_suffix}"
+        if grep -qE "^#+ +(Step +${real_num}\b|${real_num}[a-z]*\.)" "$done_before"; then
+          attempt_n=2
+          while [[ -e "${real_log}-attempt${attempt_n}" ]]; do
+            attempt_n=$((attempt_n + 1))
+          done
+          real_log="${real_log}-attempt${attempt_n}"
+          real_raw="${real_raw}-attempt${attempt_n}"
+          real_err="${real_err}-attempt${attempt_n}"
+        else
+          stale_suffix=".stale-$(date -u +%Y%m%dT%H%M%SZ)"
+          mv -f "$real_log" "${real_log}${stale_suffix}"
+          [[ -e "$real_raw" ]] && mv -f "$real_raw" "${real_raw}${stale_suffix}"
+          [[ -e "$real_err" ]] && mv -f "$real_err" "${real_err}${stale_suffix}"
+        fi
       fi
       if [[ "$real_log" != "$step_log" ]]; then
         mv -f "$step_log" "$real_log"
