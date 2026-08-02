@@ -650,6 +650,20 @@ ap() {
   fi
 }
 
+# Logs the 5h rolling-window usage percentage after a step, so a run's log
+# shows how much of the current window each step cost. `/usage` is a
+# metadata query, not a model turn — it reports 0 cost and 0 tokens — so
+# this doesn't itself eat into the window it's reporting on. Best-effort:
+# a parse or CLI failure here must never fail the step it's reporting on.
+report_usage_pct() {
+  local usage_json pct
+  usage_json="$(timeout 30 claude -p "/usage" --output-format json 2>/dev/null)"
+  pct="$(printf '%s' "$usage_json" \
+           | jq -r '.result // ""' 2>/dev/null \
+           | sed -nE 's/.*Current session: ([0-9]+)% used.*/\1/p')"
+  [[ -n "$pct" ]] && ap "5h token spend: ${pct}%"
+}
+
 # ap() plus "this is why the run ended", for the summary email. First reason
 # wins: it's the one that actually stopped things. Only this marks a run as
 # needing review — reaching MAX_STEPS or the time budget also ends the loop,
@@ -1239,6 +1253,7 @@ while (( steps_run < MAX_STEPS )); do
   completed_steps+=("$step_name")
   completed_step_nums+=("$step_num")
   ap "Finished step $step_num: $step_name (merged '$branch_name' into $BASE_BRANCH)"
+  report_usage_pct
   say "Finished step $step_num: $step_name"
 done
 
