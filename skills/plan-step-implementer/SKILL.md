@@ -21,15 +21,15 @@ background, or justification. Length costs compliance.
 Do these in order.
 
 **1. Pick the step.** Read the plan file. Steps are headings numbered
-`## Step N` or `### Na.`; a finished one ends in `— **done**`. Nothing else in
-the file is a step. Take the first step that isn't done — but read the
-surrounding prose first: if it gives an ordering or dependency reason ("2e
+`## Step N` or `### Step N.M`; a finished one ends in `— **done**`. Nothing
+else in the file is a step. Take the first step that isn't done — but read the
+surrounding prose first: if it gives an ordering or dependency reason ("2.5
 moved first because..."), follow that over document order.
 
 If every step is done, print `NO_PENDING_STEPS`, change nothing, and stop.
 
 Print `AUTOPILOT_STEP=<N>` alone on its line, where `<N>` is the number from
-the heading (`## Step N` or `### Na.` — either way just `N`, no letter).
+the heading (`## Step N` or `### Step N.M` — either way just `N`, no `.M`).
 
 **2. Branch.** Before editing anything:
 
@@ -60,7 +60,7 @@ there.
 
 **7. Write the summary.** Add an `Implementation Summary` subsection one
 heading level deeper than the step (`###` under `## Step N`, `####` under
-`### Na.`), at the very end of that step's content — after its last sub-step,
+`### Step N.M`), at the very end of that step's content — after its last sub-step,
 before the next step's heading. A few sentences or short bullets:
 
 - what changed (files, behavior), especially where you diverged from a

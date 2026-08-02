@@ -1,24 +1,22 @@
 # claude-autopilot-plan-implementer
 
-Run a project's plan file through Claude Code, one step at a time, each in a
-fresh session, committing after each step that passes its tests.
+Use this project to automatically implement a plan file in a git repo, one step at a time, while you are away from your computer.
+Includes Claude usage-limit retry behavior.
 
-Two pieces:
+Components:
 
-- **`autopilot.sh`** — a bash harness. Reads a plan file (default
-  `docs/plan.md`) in whatever project you run it from, invokes a fresh
-  `claude -p` session per step via the `plan-step-implementer` skill,
-  verifies the result (`./run_tests.sh`), and commits/merges on success. Full
-  behavior, environment variables and guarantees are documented in its own
-  `-h`/`--help`.
-- **`autopilot_notify.py`** — sends a plain-text email summary when a run
-  ends (finished, stopped for review, or interrupted). Configured via
-  `EMAIL_ENABLED` and `SMTP_*`/`EMAIL_*` vars in **this repo's own `.env`**
-  (copy `.env.example`) — never the project being worked on. One setup
-  covers every project you run autopilot in.
+- **`autopilot.sh`** — a bash harness that performs the following:
+  1. Runs a project's plan file through Claude Code, one step at a time, using a
+     fresh Claude session with the `plan-step-implementer` skill for each step.
+  2. After the skill has implemented a step, verifies the result (`./run_tests.sh`),
+     and commits/merges on success.
+  3. Sends a plain-text email summary (using `autopilot_notify.py`) when a run ends--finished, stopped
+     for review, or interrupted.
 - **`plan-step-implementer`** (`skills/plan-step-implementer/SKILL.md`) — the
-  Claude Code skill that actually reads the plan and implements one step.
-  Installed globally so it works in any project.
+  Claude Code skill that actually reads the plan, creates a branch and implements
+  one step.
+  
+Both pieces are installed globally so they work in any project.
 
 ## Install
 
@@ -35,10 +33,11 @@ Make sure `~/.local/bin` is on your `PATH` (`install.sh` warns if it isn't).
 Re-run `install.sh` any time after pulling changes — the symlinks mean you
 usually don't need to.
 
-Optional: `cp .env.example .env` and fill in `EMAIL_*`/`SMTP_*` here if you
-want run-summary emails. Projects you run autopilot against need nothing —
-no config, no dependency, no reference to autopilot at all. Using it is
-entirely your call, not theirs.
+Optional: `cp .env.example .env` and fill in `EMAIL_*`/`SMTP_*` if you
+want run-summary emails. 
+
+Projects you run autopilot against need nothing —
+no config, no dependency, no reference to autopilot at all.
 
 ## Use
 
@@ -51,26 +50,31 @@ autopilot
 ```
 
 See `autopilot --help` for the full contract: how steps are picked, branched,
-verified and merged; usage-limit retry behavior; log locations; every
-environment variable.
+verified and merged; usage-limit retry behavior; log locations; environment variables.
 
-## Requirements
+By default it looks for plan file `docs/plan.md`. 
 
-`claude` (Claude Code CLI), `jq`, and `timeout` (or `gtimeout` on macOS via
-`brew install coreutils`) on `PATH`.
+### Plan file format
 
-## Plan file format
+Steps must be markdown headings: `## Step N` or `### Step N.M` for sub-steps. A
+finished one will be marked with `— **done**`. 
+E.g., 
+```
+## Step 2 — Source registry and schema
+...
+### Step 2.1 - `storage/db.py` — one new column — **done**
+...
+```
 
-Steps are markdown headings: `## Step N` or `### Na.` for sub-steps. A
-finished one ends in `— **done**`. The skill picks the first one that isn't,
-implements only that step, and marks it done — see
+The skill picks the first one that isn't marked done and implements only that step.
+It marks it done if successfully implemented — see
 `skills/plan-step-implementer/SKILL.md` for the full contract, including the
 sentinel lines (`AUTOPILOT_STEP=`, `AUTOPILOT_BRANCH=`, `NO_PENDING_STEPS`,
 `HUMAN_REVIEW_REQUIRED`) it reports back to `autopilot.sh`.
 
-## Developing this repo with itself
+## Requirements
 
-If you point `autopilot` at this repo's own plan file, `bin/autopilot.sh`,
-`bin/autopilot_notify.py` and `skills/plan-step-implementer/SKILL.md` are
-protected the same way any other project's harness files would be if it
-happened to contain them: a step that edits them is never committed.
+`claude` (Claude Code CLI), `jq`, and `timeout` (or `gtimeout` on macOS via
+`brew install coreutils`) on `PATH`. 
+
+This project was only tested on Linux. As of 2026-08-02 it has only been lightly tested.

@@ -65,7 +65,7 @@ Without those checks a session that finished the work but forgot the marker
 would be committed and merged, and the next session would read the same
 unmarked plan and redo the same step, repeatedly.
 
-Only headings that name a step count — "## Step 4" or "### 7a." — so an
+Only headings that name a step count — "## Step 4" or "### Step 7.1" — so an
 "### Implementation Summary" or any other prose heading can't satisfy the
 gate by accident.
 
@@ -250,10 +250,10 @@ EFFORT_DESC="${AUTOPILOT_EFFORT:-inherited from your Claude Code settings}"
 LIMIT_TEXT_RE='usage limit|rate limit|quota exceeded|too many requests|resets at'
 
 # A heading only counts as a finished step if it *names* a step: "## Step 4"
-# or "### 7a.". Plan files carry plenty of other headings — Implementation
+# or "### Step 7.1". Plan files carry plenty of other headings — Implementation
 # Summary, Scope, Not in scope — and one of those picking up a "**done**"
 # marker must not be able to satisfy the commit gate.
-DONE_HEADING_RE='^#+ +(Step +[0-9]+|[0-9]+[a-z]*\.).*\*\*done\*\*'
+DONE_HEADING_RE='^#+ +Step +[0-9]+(\.[0-9]+)?\b.*\*\*done\*\*'
 
 # top-level messages (not tied to a specific step) just print to the terminal
 say() { echo "AP: $(date '+%Y-%m-%d %H:%M:%S') | $*"; }
@@ -727,8 +727,8 @@ while (( steps_run < MAX_STEPS )); do
 
   # The real step number isn't known until the skill reports it via the
   # AUTOPILOT_STEP sentinel (parsed below, after the attempt runs) — plan
-  # headings don't map 1:1 onto done_before_count, since sub-steps like 2a-2g
-  # each get their own '**done**' marker. Until then, claim a provisional,
+  # headings don't map 1:1 onto done_before_count, since sub-steps like
+  # 2.1-2.7 each get their own '**done**' marker. Until then, claim a provisional,
   # unused log number so no earlier log — including a failed step's, which is
   # the one you most want to keep — is ever overwritten. A usage-limit retry
   # keeps appending to its own (by then possibly-renamed) logs.
@@ -898,8 +898,8 @@ while (( steps_run < MAX_STEPS )); do
       # A file already sitting at the real number is one of two things, told
       # apart by whether a heading numbered $real_num was already done
       # *before* this attempt started: a parent "## Step N" and its
-      # sub-steps "### Na./Nb./..." all report the same bare N (SKILL.md
-      # strips the letter), so a done N-heading means this collision is a
+      # sub-steps "### Step N.1/N.2/..." all report the same bare N (SKILL.md
+      # strips the ".M"), so a done N-heading means this collision is a
       # real, already-completed sibling's log -- give this attempt a
       # suffixed name instead of touching it. Otherwise the existing file is
       # a stale provisional log from an earlier attempt at this same step
@@ -909,7 +909,7 @@ while (( steps_run < MAX_STEPS )); do
       # leftovers permanently steal numbers, drifting every later step
       # further from its actual plan heading.
       if [[ -e "$real_log" ]] && [[ "$real_log" != "$step_log" ]]; then
-        if grep -qE "^#+ +(Step +${real_num}\b|${real_num}[a-z]*\.)" "$done_before"; then
+        if grep -qE "^#+ +Step +${real_num}(\.[0-9]+)?\b" "$done_before"; then
           attempt_n=2
           while [[ -e "${real_log}-attempt${attempt_n}" ]]; do
             attempt_n=$((attempt_n + 1))
@@ -1219,8 +1219,8 @@ while (( steps_run < MAX_STEPS )); do
   done_headings="$(comm -13 "$done_before" "$done_after")"
 
   # Name the commit after the heading the skill just marked done. Prefer the
-  # most specific one: a session finishing sub-step 2h may also mark its
-  # parent Step 2 done, and "2h" is the more accurate label for this commit.
+  # most specific one: a session finishing sub-step 2.8 may also mark its
+  # parent Step 2 done, and "2.8" is the more accurate label for this commit.
   # Depth is the length of the leading run of '#' only — counting every '#' on
   # the line would rank a heading that merely mentions one as the deepest.
   step_name=$(printf '%s\n' "$done_headings" \
