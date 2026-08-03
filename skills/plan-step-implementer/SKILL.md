@@ -100,10 +100,21 @@ resolve entries already in it.
    made, anything a reviewer should look at twice. Facts only: no restating
    the plan's text, no progress commentary, no previewing what you're about to
    do. Your extended thinking and tool output are stripped from the log; this
-   narration is all that survives. This narration streams straight into the
-   run log with no reformatting, so start every separate remark with `- ` on
-   its own line — one bullet per thought, never several run together with no
-   break.
+   narration is all that survives.
+
+   This narration streams straight into the run log with **no reformatting
+   and no added line breaks** — the bytes you emit are the bytes that land in
+   the log. Never write flowing prose or paragraphs. Every remark is its own
+   bullet: a literal newline, then `- `, then one fact. Example, correct:
+
+   ```
+   - Picked Step 5: quote_location.py didn't exist yet.
+   - Extracted transcript_cache.py so both modules share the loader.
+   - Added QUOTE_MATCH_MIN_SIMILARITY; documented in README.
+   ```
+
+   Wrong (never do this — no bullets, no line break between remarks):
+   `Now let's add the module. Good — settings already exist.`
 
 ## Token budget
 
