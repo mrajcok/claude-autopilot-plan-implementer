@@ -247,7 +247,10 @@ EFFORT_DESC="${AUTOPILOT_EFFORT:-inherited from your Claude Code settings}"
 # Only ever matched against Claude's stderr and its final result message —
 # never against the model's own narration, which in a project like this one
 # routinely discusses rate limiting and would otherwise self-trigger.
-LIMIT_TEXT_RE='usage limit|rate limit|quota exceeded|too many requests|resets at'
+# 'session limit' and the bare 'resets <time>' form are both from a real
+# exhaustion message: "You've hit your session limit · resets 11:30pm
+# (America/New_York)" — which the earlier 'resets at' alternative did not match.
+LIMIT_TEXT_RE='usage limit|rate limit|session limit|limit reached|quota exceeded|too many requests|out of credits|resets? (at )?[0-9]'
 
 # A heading only counts as a finished step if it *names* a step: "## Step 4"
 # or "### Step 7.1". Plan files carry plenty of other headings — Implementation
@@ -379,13 +382,75 @@ if [[ -z "$BASE_BRANCH" ]]; then
   exit 1
 fi
 
-# A previous run that stopped for review leaves its step branch checked out.
-# Starting from there would quietly make that abandoned branch the merge
-# target for everything that follows.
+# The branch an autopilot/* step branch was cut from: the nearest local
+# non-autopilot branch that is an ancestor of it. Ties (several branches at the
+# same commit, the usual case since a step branch starts level with its base)
+# go to the conventional default names before anything else.
+detect_base_branch() {
+  local head="$1" b best="" nb nbest
+  while read -r b; do
+    [[ -z "$b" || "$b" == autopilot/* ]] && continue
+    git merge-base --is-ancestor "$b" "$head" 2>/dev/null || continue
+    if [[ -z "$best" ]]; then
+      best="$b"
+      continue
+    fi
+    nb=$(git rev-list --count "$b..$head" 2>/dev/null || echo 999999)
+    nbest=$(git rev-list --count "$best..$head" 2>/dev/null || echo 999999)
+    if (( nb < nbest )); then
+      best="$b"
+    elif (( nb == nbest )) && [[ "$best" != main && "$best" != master ]] \
+         && [[ "$b" == main || "$b" == master ]]; then
+      best="$b"
+    fi
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+  printf '%s' "$best"
+}
+
+# A step branch left checked out is a step that was interrupted — a usage limit
+# that outlasted the run budget, a stopped-for-review, or a killed run. Starting
+# a fresh run from here would quietly make that abandoned branch the merge
+# target for everything after it, so it is never simply used as the base.
+#
+# Instead the run picks that step back up: the partial work is committed to its
+# own branch, the real base is checked out, and the first step of this run
+# resumes that branch rather than starting the step over. Set
+# AUTOPILOT_NO_RESUME=1 for the old behaviour of refusing to start.
+STARTUP_RESUME_BRANCH=""
 if [[ "$BASE_BRANCH" == autopilot/* ]]; then
-  say "ERROR: currently on '$BASE_BRANCH', which looks like an abandoned autopilot step branch."
-  say "A previous run probably stopped for review here. Inspect it, then check out your real base branch (e.g. 'git checkout main') and re-run."
-  exit 1
+  if [[ "${AUTOPILOT_NO_RESUME:-0}" == "1" ]]; then
+    say "ERROR: currently on '$BASE_BRANCH', which looks like an abandoned autopilot step branch."
+    say "A previous run probably stopped for review here. Inspect it, then check out your real base branch (e.g. 'git checkout main') and re-run."
+    exit 1
+  fi
+  STARTUP_RESUME_BRANCH="$BASE_BRANCH"
+  BASE_BRANCH="${AUTOPILOT_BASE_BRANCH:-$(detect_base_branch "$STARTUP_RESUME_BRANCH")}"
+  if [[ -z "$BASE_BRANCH" ]]; then
+    say "ERROR: currently on '$STARTUP_RESUME_BRANCH', an autopilot step branch, and I can't tell which branch it was cut from."
+    say "Check out your real base branch (e.g. 'git checkout main') and re-run, or set AUTOPILOT_BASE_BRANCH."
+    exit 1
+  fi
+  if ! git rev-parse -q --verify "refs/heads/$BASE_BRANCH" >/dev/null 2>&1; then
+    say "ERROR: AUTOPILOT_BASE_BRANCH='$BASE_BRANCH' is not a local branch."
+    exit 1
+  fi
+
+  say "Found an interrupted step on '$STARTUP_RESUME_BRANCH' (base branch looks like '$BASE_BRANCH')."
+  if [[ -n "$(git status --porcelain)" ]]; then
+    say "Committing its uncommitted work to that branch so this run can resume it:"
+    git status --short
+    if ! git add -A || ! git commit -m "Autopilot WIP (interrupted step, resumed by a later run)"; then
+      say "ERROR: couldn't commit the partial work on '$STARTUP_RESUME_BRANCH'. Sort it out by hand, then re-run."
+      exit 1
+    fi
+  else
+    say "Its work is already committed."
+  fi
+  if ! git checkout "$BASE_BRANCH"; then
+    say "ERROR: couldn't check out '$BASE_BRANCH'. Sort it out by hand, then re-run."
+    exit 1
+  fi
+  say "This run's first step will resume '$STARTUP_RESUME_BRANCH' instead of starting a new step."
 fi
 
 # A merge this script failed to complete leaves conflict markers on the base
@@ -441,6 +506,10 @@ RUN_START=$(date +%s)
 run_deadline=$(( RUN_START + MAX_RUN_SECONDS ))
 steps_run=0
 retry_pending=0
+# Set when a step that had already branched was interrupted — by a usage limit
+# mid-run, or by an earlier run that ended with the branch still checked out.
+# The next step resumes that branch instead of starting the step over.
+resume_branch="$STARTUP_RESUME_BRANCH"
 limit_hits=0
 step_log=""
 raw_log=""
@@ -605,11 +674,34 @@ done_after="$SCRATCH_DIR/done-after.txt"
 # after it — and a stream truncated mid-line is exactly what killing Claude
 # produces. Losing the tail of the stream means losing the sentinels and the
 # AUTOPILOT_BRANCH line, which this script then misreads as "did nothing".
+#
+# The text is emitted with jq -j (no separator), so consecutive assistant
+# messages would otherwise concatenate with nothing between them: an assistant
+# turn's text never ends in a newline (trailing whitespace is stripped at
+# message end), and the skill's narration is split across many turns by its
+# tool calls. That is what produced log lines like
+# "...conversation flow.AUTOPILOT_STEP=9AUTOPILOT_BRANCH=autopilot/...".
+# No skill instruction can fix it — the model *did* print each sentinel alone
+# on its line, in three separate messages. message_stop marks each of those
+# boundaries, so emit the paragraph break there.
+#
+# Run with -n so `inputs` drives the loop: the separator is only emitted for a
+# message that actually produced text, so the many text-less messages (a turn
+# that only calls a tool) don't stack up runs of blank lines in the log.
 text_filter="$SCRATCH_DIR/text-delta.jq"
 cat > "$text_filter" <<'EOF'
-fromjson?
-| select(.type == "stream_event" and .event.delta.type? == "text_delta")
-| .event.delta.text
+foreach inputs as $line ({emit: "", intext: false};
+  ($line | fromjson?) as $e
+  | if $e == null or $e.type != "stream_event" then
+      {emit: "", intext: .intext}
+    elif $e.event.delta.type? == "text_delta" then
+      {emit: $e.event.delta.text, intext: true}
+    elif $e.event.type == "message_stop" and .intext then
+      {emit: "\n\n", intext: false}
+    else
+      {emit: "", intext: .intext}
+    end;
+  .emit)
 EOF
 
 # Fallback for when no partial-message events arrived at all: pull the text
@@ -748,7 +840,25 @@ while (( steps_run < MAX_STEPS )); do
   is_retry=$retry_pending
   retry_pending=0
 
-  if (( is_retry )); then
+  # A resumed step goes back onto its own branch, carrying the WIP commit the
+  # limit interrupted. The skill is told the branch name so it skips its own
+  # `git checkout -b` and works out what's already done from the diff.
+  step_prompt="/plan-step-implementer \"$PLAN_FILE\""
+  if [[ -n "$resume_branch" ]]; then
+    if git rev-parse -q --verify "refs/heads/$resume_branch" >/dev/null 2>&1 \
+       && git checkout "$resume_branch" >> "$step_log" 2>&1; then
+      step_prompt="$step_prompt RESUME_BRANCH=$resume_branch"
+      if (( is_retry )); then
+        ap "Resuming step $step_num on '$resume_branch' after a usage-limit wait ($limit_hits of $MAX_LIMIT_RETRIES tolerated hits so far). The session continues that branch's partial work."
+      else
+        ap "Resuming the step interrupted by an earlier run, on '$resume_branch'. The session continues that branch's partial work rather than starting a new step."
+      fi
+    else
+      ap "WARNING: couldn't check out '$resume_branch' to resume step $step_num; starting the step over from $BASE_BRANCH instead."
+      resume_branch=""
+      ap "Starting the next step (session will pick the next undone step from $PLAN_FILE and branch off $BASE_BRANCH)"
+    fi
+  elif (( is_retry )); then
     ap "Retrying step $step_num after a usage-limit wait ($limit_hits of $MAX_LIMIT_RETRIES tolerated hits so far)"
   else
     ap "Starting the next step (session will pick the next undone step from $PLAN_FILE and branch off $BASE_BRANCH)"
@@ -797,11 +907,11 @@ while (( steps_run < MAX_STEPS )); do
   # step instead of going silent until the whole attempt finishes.
   run_interruptible "${step_timeout[@]}" bash -c '
     set -uo pipefail
-    plan=$1; model=$2; effort=$3; out=$4; err=$5; raw=$6; filter=$7; status=$8; log=$9
+    prompt=$1; model=$2; effort=$3; out=$4; err=$5; raw=$6; filter=$7; status=$8; log=$9
     shift 9
     eff=()
     [[ -n "$effort" ]] && eff=(--effort "$effort")
-    claude -p "/plan-step-implementer \"$plan\"" \
+    claude -p "$prompt" \
       --model "$model" \
       "${eff[@]+"${eff[@]}"}" \
       --dangerously-skip-permissions \
@@ -811,11 +921,11 @@ while (( steps_run < MAX_STEPS )); do
       "$@" \
       2>>"$err" \
       | tee -a "$raw" \
-      | jq --unbuffered -Rrj -f "$filter" \
+      | jq -n --unbuffered -Rrj -f "$filter" \
       | tee -a "$out" >> "$log"
     echo "${PIPESTATUS[0]}" > "$status"
   ' autopilot-attempt \
-      "$PLAN_FILE" "$AUTOPILOT_MODEL" "$AUTOPILOT_EFFORT" \
+      "$step_prompt" "$AUTOPILOT_MODEL" "$AUTOPILOT_EFFORT" \
       "$attempt_text" "$attempt_err" "$attempt_raw" "$text_filter" "$attempt_status" "$step_log" \
       "${claude_extra_flags[@]+"${claude_extra_flags[@]}"}"
   wrapper_exit=$?
@@ -875,6 +985,15 @@ while (( steps_run < MAX_STEPS )); do
      && [[ "$branch_name" == "$actual_now"* ]]; then
     ap "NOTE: the AUTOPILOT_BRANCH line ran into the prose after it ('$reported_branch'); using the checked-out branch '$actual_now'."
     branch_name="$actual_now"
+  fi
+
+  # A resumed step is already standing on its branch when the session starts,
+  # so the skill has no checkout to report. It is told to echo the name back
+  # anyway, but not reporting it must not fail a step whose branch this script
+  # chose itself and can see is still checked out.
+  if [[ -z "$branch_name" && -n "$resume_branch" && "$actual_now" == "$resume_branch" ]]; then
+    ap "NOTE: the resumed session didn't echo AUTOPILOT_BRANCH; using the branch it was resumed on ('$resume_branch')."
+    branch_name="$resume_branch"
   fi
 
   # The provisional step_num above is just an unused-log-slot counter, not
@@ -980,26 +1099,56 @@ while (( steps_run < MAX_STEPS )); do
   # the base branch. That means retrying is safe — there's no partial work to
   # abandon. Deliberately *not* gated on a non-zero exit code: `claude -p`
   # doesn't reliably exit non-zero when a request is refused.
-  usage_limit_hit=0
+  # Detection runs unconditionally, *before* any of those preconditions are
+  # applied. Gating the detection itself on "accomplished nothing" is what let
+  # a mid-step limit be reported as a bare "Claude exited with code 1 ...
+  # (stderr: ...)" against an empty .err file: the limit never reaches stderr,
+  # it arrives on the JSON stream. Whether the run can *retry* is a separate
+  # question, decided below.
+  saw_limit=0
   limit_wait_seconds=0
   limit_wait_desc=""
-  if (( ! saw_no_pending )) && (( ! saw_review )) && [[ -z "$branch_name" ]] \
-     && [[ "$(git branch --show-current)" == "$BASE_BRANCH" ]]; then
-    # Parsed with jq rather than grepped: a whitespace change in the stream's
-    # JSON formatting would silently disable a grep for '"type":"..."'. Read
-    # per line via fromjson? for the same reason as the text filter — one
-    # truncated line must not take the whole parse down with it.
-    rl_info=$(jq -Rr 'fromjson?
-                      | select(.type == "rate_limit_event")
-                      | .rate_limit_info
-                      | select(.status == "rejected")
-                      | "\(.resetsAt // "") \(.rateLimitType // "unknown")"' \
-                  "$attempt_raw" 2>/dev/null | tail -n1)
-    rl_resets_at="${rl_info%% *}"
-    rl_type="${rl_info##* }"
-    saw_rejection=0
-    [[ -n "$rl_info" ]] && saw_rejection=1
 
+  # Parsed with jq rather than grepped: a whitespace change in the stream's
+  # JSON formatting would silently disable a grep for '"type":"..."'. Read
+  # per line via fromjson? for the same reason as the text filter — one
+  # truncated line must not take the whole parse down with it.
+  rl_info=$(jq -Rr 'fromjson?
+                    | select(.type == "rate_limit_event")
+                    | .rate_limit_info
+                    | select(.status == "rejected")
+                    | "\(.resetsAt // "") \(.rateLimitType // "unknown")"' \
+                "$attempt_raw" 2>/dev/null | tail -n1)
+  rl_resets_at="${rl_info%% *}"
+  rl_type="${rl_info##* }"
+  saw_rejection=0
+  [[ -n "$rl_info" ]] && saw_rejection=1
+
+  # The final result record carries the HTTP status directly. This is the
+  # sturdiest signal of the three — it needs no prose matching and no
+  # rate_limit_event — so it is checked alongside them rather than only as a
+  # last resort. Observed on a real exhaustion: api_error_status 429 with
+  # subtype "success" and is_error true, so neither subtype nor exit code can
+  # be trusted to classify this.
+  result_text=$(jq -Rr 'fromjson?
+                        | select(.type == "result")
+                        | [.result?, .error?]
+                        | map(select(. != null) | tostring)
+                        | join(" ")' "$attempt_raw" 2>/dev/null)
+  saw_429=0
+  if jq -e -Rr 'fromjson? | select(.type == "result")
+                | select((.api_error_status? // 0) == 429)' \
+        "$attempt_raw" >/dev/null 2>&1; then
+    saw_429=1
+  fi
+
+  if (( saw_rejection )) || (( saw_429 )) \
+     || grep -qiE "$LIMIT_TEXT_RE" <<<"$result_text" \
+     || grep -qiE "$LIMIT_TEXT_RE" "$attempt_err"; then
+    saw_limit=1
+  fi
+
+  if (( saw_limit )); then
     # A resetsAt is only believed if it lands in a plausible window. The
     # failure this guards against is the field's units changing (epoch
     # milliseconds reads as a date ~55,000 years out): the cap below would
@@ -1017,7 +1166,6 @@ while (( steps_run < MAX_STEPS )); do
     fi
 
     if (( rl_trusted )); then
-      usage_limit_hit=1
       limit_wait_seconds=$(( rl_delta + 15 ))
       limit_wait_desc="until the reported ${rl_type:-unknown} reset time ($(fmt_epoch "$rl_resets_at"))"
       if (( limit_wait_seconds > MAX_LIMIT_SLEEP_SECONDS )); then
@@ -1026,22 +1174,69 @@ while (( steps_run < MAX_STEPS )); do
       fi
       (( limit_wait_seconds < 60 )) && limit_wait_seconds=60
     else
-      # Fallback: a rejection we couldn't time, or — failing that — the CLI's
-      # own stderr plus the text of the final result message. Both of those
-      # are the harness talking, not the model.
-      result_text=$(jq -Rr 'fromjson?
-                            | select(.type == "result")
-                            | [.result?, .error?]
-                            | map(select(. != null) | tostring)
-                            | join(" ")' "$attempt_raw" 2>/dev/null)
-      if (( saw_rejection )) \
-         || grep -qiE "$LIMIT_TEXT_RE" <<<"$result_text" \
-         || grep -qiE "$LIMIT_TEXT_RE" "$attempt_err"; then
+      limit_wait_seconds=$LIMIT_RETRY_WAIT_SECONDS
+      limit_wait_desc="a blind ${LIMIT_RETRY_WAIT_SECONDS}s wait (no usable reset time reported)"
+    fi
+  fi
+
+  # Now decide whether this limit is retryable. The retry path re-runs the
+  # step from scratch, so it needs the same starting state every step gets:
+  # on $BASE_BRANCH with a clean tree. Three cases reach that state.
+  usage_limit_hit=0
+  if (( saw_limit )) && (( ! saw_no_pending )) && (( ! saw_review )); then
+    cur_branch="$(git branch --show-current)"
+    if [[ -z "$branch_name" ]] && [[ "$cur_branch" == "$BASE_BRANCH" ]] \
+       && [[ -z "$(git status --porcelain)" ]]; then
+      # Nothing happened before the limit landed. Retry outright.
+      usage_limit_hit=1
+
+    elif [[ -n "$branch_name" ]] && [[ "$branch_name" == autopilot/* ]] \
+         && [[ "$branch_name" != "$BASE_BRANCH" ]] \
+         && [[ "$cur_branch" == "$branch_name" ]]; then
+      # The usual case: the skill branched, edited files, then ran out mid-step.
+      # The partial work is committed to its own branch and the branch is kept:
+      # the retry *resumes* on it rather than starting the step over, so those
+      # edits are the whole point. Committing rather than leaving the tree
+      # dirty is what makes the work survive the wait — a 5h sleep is ample
+      # time for the run to be killed, and a dirty tree would then block the
+      # next run from starting at all.
+      #
+      # Base is checked out for the duration of the sleep so that a run killed
+      # mid-wait leaves the repo somewhere sane; the retry checks the branch
+      # back out at the top of the loop.
+      ap "Usage limit hit mid-step on '$branch_name'. Committing its partial work so step $step_num can resume on that branch after the wait."
+      if git add -A >> "$step_log" 2>&1 \
+         && { [[ -z "$(git status --porcelain)" ]] \
+              || git commit -m "Autopilot WIP (usage limit): partial step $step_num" >> "$step_log" 2>&1; } \
+         && git checkout "$BASE_BRANCH" >> "$step_log" 2>&1; then
+        ap "Parked. Step $step_num will resume on '$branch_name' — the next session picks up where this one stopped."
         usage_limit_hit=1
-        limit_wait_seconds=$LIMIT_RETRY_WAIT_SECONDS
-        limit_wait_desc="a blind ${LIMIT_RETRY_WAIT_SECONDS}s wait (no usable reset time reported)"
+        resume_branch="$branch_name"
+        branch_name=""
+      else
+        ap "WARNING: couldn't park the partial work on '$branch_name' (now on '$(git branch --show-current)')."
+      fi
+
+    elif [[ -z "$branch_name" ]] && [[ "$cur_branch" == "$BASE_BRANCH" ]]; then
+      # Ran out after editing but before branching (the skill branches first,
+      # so this needs the checkout itself to have failed). Stashing is
+      # lossless and recoverable via `git stash list`.
+      ap "Usage limit hit before step $step_num branched, with changes on $BASE_BRANCH. Stashing them so the step can be retried."
+      if git stash push -u -m "autopilot: partial step $step_num before usage limit" >> "$step_log" 2>&1; then
+        ap "Stashed. Recover with 'git stash list' / 'git stash show -p'; retrying step $step_num from scratch after the wait."
+        usage_limit_hit=1
+      else
+        ap "WARNING: couldn't stash the partial work on $BASE_BRANCH."
       fi
     fi
+  fi
+
+  # A limit that could not be made retryable still gets named as a limit,
+  # rather than falling through to the generic non-zero-exit message.
+  if (( saw_limit )) && (( ! usage_limit_hit )) \
+     && (( ! saw_no_pending )) && (( ! saw_review )); then
+    stop "Claude hit a usage limit on step $step_num and the run could not be put back into a retryable state (on '$(git branch --show-current)', branch '${branch_name:-none}'). Stopping for review — the limit resets $( [[ "$rl_resets_at" =~ ^[0-9]+$ ]] && fmt_epoch "$rl_resets_at" || echo "at an unreported time")."
+    break
   fi
 
   if (( usage_limit_hit )); then
@@ -1072,7 +1267,15 @@ while (( steps_run < MAX_STEPS )); do
   fi
 
   if [[ $claude_exit -ne 0 ]]; then
-    stop "Claude exited with code $claude_exit on step $step_num. Stopping for review (stderr: $err_log)."
+    # Only point at the .err file when it has something in it. API-side
+    # failures (usage limits, 429s, overload) never touch stderr — they come
+    # back on the JSON stream — so citing an empty file sends you looking in
+    # the one place the answer is guaranteed not to be.
+    if [[ -s "$err_log" ]]; then
+      stop "Claude exited with code $claude_exit on step $step_num. Stopping for review (stderr: $err_log)."
+    else
+      stop "Claude exited with code $claude_exit on step $step_num, with nothing on stderr. Stopping for review — the reason will be in the stream: jq -Rr 'fromjson? | select(.type==\"result\" or .type==\"rate_limit_event\")' $raw_log | tail -5"
+    fi
     break
   fi
 
@@ -1249,6 +1452,9 @@ while (( steps_run < MAX_STEPS )); do
     ap "WARNING: couldn't delete '$branch_name' after merging it. The step is committed and merged; clean up with: git branch -D '$branch_name'"
   fi
 
+  # The step is merged and its branch gone, so any pending resume is settled.
+  # Leaving it set would send the *next* step onto a deleted branch.
+  resume_branch=""
   steps_run=$((steps_run + 1))
   completed_steps+=("$step_name")
   completed_step_nums+=("$step_num")

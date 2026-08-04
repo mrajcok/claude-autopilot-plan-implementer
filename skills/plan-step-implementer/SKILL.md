@@ -4,7 +4,8 @@ description: Implements the next unfinished step in this project's plan file, ma
 disable-model-invocation: true
 ---
 
-`$ARGUMENTS` is the path to this project's plan file.
+`$ARGUMENTS` is the path to this project's plan file, optionally followed by
+`RESUME_BRANCH=<name>`.
 
 You are running unattended. Nobody can answer questions, so make reasonable,
 conservative decisions and keep going — unless a rule below tells you to stop.
@@ -15,6 +16,24 @@ them.
 **Keep this file lean.** When asked to edit it (interactive sessions only —
 Rule 3 forbids it during a run), state what to do, never why. Add no rationale,
 background, or justification. Length costs compliance.
+
+## Resuming
+
+If `$ARGUMENTS` contains `RESUME_BRANCH=<name>`, a previous session ran out of
+tokens partway through a step and committed what it had. That branch is already
+checked out. Then:
+
+- Skip steps 1 and 2 below. Do not run `git checkout -b`; do not pick a
+  different step.
+- Work out where the previous session stopped: `git log <base>..HEAD` for its
+  WIP commit, `git diff <base>...HEAD --stat` for the files it touched. The
+  step it was on is the first one in the plan file not marked `— **done**`.
+- Print `AUTOPILOT_STEP=<N>` and `AUTOPILOT_BRANCH=<name>` (the resumed branch)
+  alone on their own lines, as below.
+- Say in one bullet what the previous session had finished and what you are
+  picking up.
+- Then continue at step 4: finish that same step, keeping the existing work.
+  Redo only what's actually incomplete or wrong.
 
 ## Workflow
 
@@ -77,7 +96,8 @@ resolve entries already in it.
 
 1. **One step per session**, even if a neighboring one looks related.
 
-2. **No git beyond the one `git checkout -b`.** No `add`, `commit`, `merge`,
+2. **No git beyond the one `git checkout -b`** (none at all when resuming —
+   the branch is already checked out). No `add`, `commit`, `merge`,
    `push`, `stash`, `reset`; no switching branches again. Read-only git
    (`status`, `diff`, `log`, `show`) is fine. This constrains your own git
    commands, not the project's code.
@@ -102,19 +122,7 @@ resolve entries already in it.
    do. Your extended thinking and tool output are stripped from the log; this
    narration is all that survives.
 
-   This narration streams straight into the run log with **no reformatting
-   and no added line breaks** — the bytes you emit are the bytes that land in
-   the log. Never write flowing prose or paragraphs. Every remark is its own
-   bullet: a literal newline, then `- `, then one fact. Example, correct:
-
-   ```
-   - Picked Step 5: quote_location.py didn't exist yet.
-   - Extracted transcript_cache.py so both modules share the loader.
-   - Added QUOTE_MATCH_MIN_SIMILARITY; documented in README.
-   ```
-
-   Wrong (never do this — no bullets, no line break between remarks):
-   `Now let's add the module. Good — settings already exist.`
+   Write each remark as its own `- ` bullet on its own line.
 
 ## Token budget
 
