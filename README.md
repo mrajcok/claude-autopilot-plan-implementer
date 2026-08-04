@@ -49,8 +49,21 @@ tmux new -s autopilot   # autopilot refuses to run outside tmux
 autopilot
 ```
 
+A run has to outlive its terminal, but it doesn't have to be tmux. To run
+detached instead:
+
+```bash
+AUTOPILOT_ALLOW_NO_TMUX=1 nohup autopilot > /dev/null 2>&1 &
+tail -f logs/autopilot-run.log
+```
+
+Everything the terminal would have shown is appended to
+`logs/autopilot-run.log`, so nothing is lost when the shell goes away —
+discarding stdout entirely, as above, costs you nothing.
+
 See `autopilot --help` for the full contract: how steps are picked, branched,
-verified and merged; usage-limit retry behavior; log locations; environment variables.
+verified and merged; usage-limit retry and resume behavior; log locations;
+environment variables.
 
 By default it looks for plan file `docs/plan.md`. 
 

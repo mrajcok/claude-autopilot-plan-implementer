@@ -77,6 +77,16 @@ logs/autopilot-step-<n>.err (both written after the step finishes). <n> is
 the next unused number, so no earlier log is ever overwritten. The logs
 directory should be gitignored; the run warns if it isn't.
 
+Every "AP:" line, including the run-level ones that belong to no step, is
+also appended to logs/autopilot-run.log — one file per project, across runs.
+That is the whole terminal transcript, so a detached run loses nothing when
+its terminal goes away, and it is the file to `tail -f` to follow a run.
+
+The run must outlive its terminal. tmux is the default way; to run detached
+without it, set AUTOPILOT_ALLOW_NO_TMUX=1 and use nohup:
+  AUTOPILOT_ALLOW_NO_TMUX=1 nohup autopilot > /dev/null 2>&1 &
+  tail -f logs/autopilot-run.log
+
 The archived .raw.jsonl has the per-token "stream_event" records stripped
 out — they are ~99% of the bytes and their text is already in the .log. The
 *unfiltered* stream is kept only for the duration of one attempt, in a temp
@@ -184,6 +194,19 @@ Environment variables:
                         is treated as unparseable and the blind wait is used.
   EMAIL_LOG_LINES       Lines from the tail of the last step log to include
                         in the summary email (default: 40).
+  AUTOPILOT_ALLOW_NO_TMUX
+                        Set to 1 to run outside tmux (default: 0, refuse).
+                        The run still has to outlive its terminal — use
+                        nohup or setsid. logs/autopilot-run.log keeps the
+                        full transcript either way.
+  AUTOPILOT_NO_RESUME   Set to 1 to refuse to start when an autopilot/*
+                        step branch is checked out (default: 0, which picks
+                        that interrupted step back up). A branch whose step
+                        printed HUMAN_REVIEW_REQUIRED is never resumed
+                        regardless.
+  AUTOPILOT_BASE_BRANCH Branch an interrupted step branch was cut from, used
+                        only when resuming one. Default: detected as the
+                        nearest local non-autopilot ancestor branch.
 EOF
 }
 
@@ -258,8 +281,21 @@ LIMIT_TEXT_RE='usage limit|rate limit|session limit|limit reached|quota exceeded
 # marker must not be able to satisfy the commit gate.
 DONE_HEADING_RE='^#+ +Step +[0-9]+(\.[0-9]+)?\b.*\*\*done\*\*'
 
-# top-level messages (not tied to a specific step) just print to the terminal
-say() { echo "AP: $(date '+%Y-%m-%d %H:%M:%S') | $*"; }
+# Set once $LOG_DIR is known to exist (below). Until then these lines can only
+# go to the terminal — nothing before that point has anywhere to write.
+RUN_LOG=""
+
+# Top-level messages, not tied to a specific step. They go to the terminal
+# *and* to the run log: with the run detached (tmux, nohup) the terminal may be
+# gone by the time anyone looks, and these lines — the run banner, the baseline
+# check, limit sleeps, the final summary — appear in no per-step log.
+say() {
+  local line
+  line="AP: $(date '+%Y-%m-%d %H:%M:%S') | $*"
+  echo "$line"
+  [[ -n "$RUN_LOG" ]] && echo "$line" >> "$RUN_LOG"
+  return 0
+}
 
 # GNU date wants -d @<epoch>, BSD/macOS date wants -r <epoch>.
 fmt_epoch() {
@@ -283,10 +319,21 @@ sleep_until() {
   done
 }
 
+# The requirement is that the run outlive the terminal, not tmux specifically.
+# nohup/setsid do that too, and are easier to page through afterwards — the run
+# log holds everything the terminal would have shown. Opting out is explicit so
+# that simply forgetting tmux still fails loudly.
 if [[ -z "${TMUX:-}" ]]; then
-  say "ERROR: not running inside tmux. If this shell dies (e.g. your SSH session drops), the run stops with it."
-  say "Run: tmux new -s autopilot   — then re-run this script inside that session."
-  exit 1
+  if [[ "${AUTOPILOT_ALLOW_NO_TMUX:-0}" == "1" ]]; then
+    say "Not inside tmux; running anyway (AUTOPILOT_ALLOW_NO_TMUX=1). Make sure this survives the terminal — e.g. 'nohup autopilot ... &'."
+  else
+    say "ERROR: not running inside tmux. If this shell dies (e.g. your SSH session drops), the run stops with it."
+    say "Either: tmux new -s autopilot   — then re-run this script inside that session."
+    say "Or, to run detached without tmux:"
+    say "  AUTOPILOT_ALLOW_NO_TMUX=1 nohup autopilot > /dev/null 2>&1 &"
+    say "  tail -f $LOG_DIR/autopilot-run.log"
+    exit 1
+  fi
 fi
 
 if ! command -v claude >/dev/null 2>&1; then
@@ -369,6 +416,17 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   say "ERROR: not inside a git repository. Run this from your project root."
   exit 1
 fi
+
+# Opened as early as the repo is confirmed, so the startup phase — base-branch
+# detection, the resume decision, the baseline test run — is on disk too. One
+# appended file across runs: it is the thing to `tail -f`, and the thing to
+# read after a detached run ends.
+mkdir -p "$LOG_DIR"
+RUN_LOG="$LOG_DIR/autopilot-run.log"
+{
+  echo
+  echo "=== autopilot run started $(date '+%Y-%m-%d %H:%M:%S') (pid $$) in $PWD ==="
+} >> "$RUN_LOG"
 
 if [[ ! -f "$SKILL_INSTALL_PATH" ]]; then
   say "ERROR: $SKILL_INSTALL_PATH not found — that skill is what actually implements each step."
@@ -768,8 +826,6 @@ cat > "$archive_filter" <<'EOF'
 if (try (fromjson | .type) catch "") == "stream_event" then empty else . end
 EOF
 
-mkdir -p "$LOG_DIR"
-
 # Probed with a filename rather than the bare directory: check-ignore reports
 # a directory as un-ignored when it holds a tracked file (logs/.gitkeep).
 if ! git check-ignore -q "$LOG_DIR/autopilot-probe.log" 2>/dev/null; then
@@ -779,11 +835,12 @@ fi
 
 # writes an AP-prefixed line to the current step's log AND the terminal
 ap() {
-  if [[ -n "$step_log" ]]; then
-    echo "AP: $(date '+%Y-%m-%d %H:%M:%S') | $*" | tee -a "$step_log"
-  else
-    say "$*"
-  fi
+  local line
+  line="AP: $(date '+%Y-%m-%d %H:%M:%S') | $*"
+  echo "$line"
+  [[ -n "$RUN_LOG" ]] && echo "$line" >> "$RUN_LOG"
+  [[ -n "$step_log" ]] && echo "$line" >> "$step_log"
+  return 0
 }
 
 # Logs the 5h rolling-window usage percentage after a step, so a run's log
