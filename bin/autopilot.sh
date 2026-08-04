@@ -417,6 +417,7 @@ detect_base_branch() {
 # resumes that branch rather than starting the step over. Set
 # AUTOPILOT_NO_RESUME=1 for the old behaviour of refusing to start.
 STARTUP_RESUME_BRANCH=""
+STARTUP_RESUME_STEP=""
 if [[ "$BASE_BRANCH" == autopilot/* ]]; then
   if [[ "${AUTOPILOT_NO_RESUME:-0}" == "1" ]]; then
     say "ERROR: currently on '$BASE_BRANCH', which looks like an abandoned autopilot step branch."
@@ -435,7 +436,50 @@ if [[ "$BASE_BRANCH" == autopilot/* ]]; then
     exit 1
   fi
 
+  # The interrupted step's own logs are still on disk, and they name the branch
+  # they were working on — which is exactly the branch being resumed. Found
+  # before anything is committed, because what that log says decides whether
+  # this run may proceed at all.
+  #
+  # Matched on the sentinel the earlier session printed rather than on any
+  # bookkeeping file this script writes: it needs no new state, and it works on
+  # logs written before this resume path existed.
+  prior_log=""
+  if [[ -d "$LOG_DIR" ]]; then
+    prior_log="$(grep -lF "AUTOPILOT_BRANCH=$STARTUP_RESUME_BRANCH" \
+                   "$LOG_DIR"/autopilot-step-*.log 2>/dev/null \
+                 | xargs -r ls -1t 2>/dev/null | head -n1)"
+  fi
+
+  # Not every step branch left checked out is one to pick back up. A step that
+  # printed HUMAN_REVIEW_REQUIRED stopped *on purpose* and asked for a human;
+  # the checked-out branch is how it blocks the next run. Auto-resuming that
+  # would silently overrule the request, so the refusal stands — and being able
+  # to name the blocker beats the old generic "abandoned branch" message.
+  if [[ -n "$prior_log" ]] \
+     && grep -qE '^[[:space:]]*HUMAN_REVIEW_REQUIRED[[:space:]]*$' "$prior_log"; then
+    say "ERROR: currently on '$STARTUP_RESUME_BRANCH', where a step stopped and asked for human review — it is not an interrupted step to resume."
+    say "What blocked it is in $prior_log. Review the branch, then check out your base branch (e.g. 'git checkout $BASE_BRANCH') and re-run."
+    exit 1
+  fi
+
   say "Found an interrupted step on '$STARTUP_RESUME_BRANCH' (base branch looks like '$BASE_BRANCH')."
+  if [[ -n "$prior_log" ]]; then
+    prior_num="$(basename "$prior_log")"
+    prior_num="${prior_num#autopilot-step-}"
+    prior_num="${prior_num%.log}"
+    # Appending keeps one step's two halves in one file. Otherwise the run
+    # claims the next free slot, and the rename-on-AUTOPILOT_STEP logic then
+    # pushes the first half aside as ".stale-<ts>" — which it is not; it is the
+    # front half of this same step.
+    if [[ "$prior_num" =~ ^[0-9]+$ ]]; then
+      STARTUP_RESUME_STEP="$prior_num"
+      say "That step logged to $prior_log — this run appends to it rather than opening a new one."
+    fi
+  else
+    say "NOTE: found no earlier log naming that branch, so this run opens a fresh step log."
+  fi
+
   if [[ -n "$(git status --porcelain)" ]]; then
     say "Committing its uncommitted work to that branch so this run can resume it:"
     git status --short
@@ -824,7 +868,22 @@ while (( steps_run < MAX_STEPS )); do
   # unused log number so no earlier log — including a failed step's, which is
   # the one you most want to keep — is ever overwritten. A usage-limit retry
   # keeps appending to its own (by then possibly-renamed) logs.
-  if (( ! retry_pending )); then
+  if [[ -n "$resume_branch" && -n "$STARTUP_RESUME_STEP" ]]; then
+    # Resuming a step an earlier run started: reopen that step's logs and
+    # append. The number came from the log that named this branch, so it is
+    # already the real plan step number — no rename is pending.
+    step_num="$STARTUP_RESUME_STEP"
+    step_num_confirmed=1
+    step_log="$LOG_DIR/autopilot-step-${step_num}.log"
+    raw_log="$LOG_DIR/autopilot-step-${step_num}.raw.jsonl"
+    err_log="$LOG_DIR/autopilot-step-${step_num}.err"
+    touch "$step_log" "$raw_log" "$err_log"
+    STARTUP_RESUME_STEP=""   # first step of the run only
+    {
+      echo
+      echo "=== resumed $(date '+%Y-%m-%d %H:%M:%S') by a later autopilot run ==="
+    } >> "$step_log"
+  elif (( ! retry_pending )); then
     step_num=$(( done_before_count + 1 ))
     while [[ -e "$LOG_DIR/autopilot-step-${step_num}.log" ]]; do
       step_num=$((step_num + 1))
