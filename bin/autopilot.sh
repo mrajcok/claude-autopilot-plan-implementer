@@ -89,9 +89,10 @@ nohup or setsid are all accepted, and detected automatically:
   setsid autopilot > /dev/null 2>&1 &
   tail -f logs/autopilot-run.log
 The choice costs nothing in logging: AP: lines are written to the run log
-directly, not by way of the terminal. Redirect stdout as shown — without it
-nohup drops a nohup.out in the project root, which fails the clean-tree
-check. Running attached is refused unless AUTOPILOT_ALLOW_NO_TMUX=1.
+directly, not by way of the terminal. The redirects shown are checked, not
+just advised — a run that would die with its terminal, a nohup writing to
+./nohup.out, or a setsid still writing to the terminal it left, each stops
+with the command to fix it. AUTOPILOT_SKIP_DETACH_CHECK=1 skips all three.
 
 The archived .raw.jsonl has the per-token "stream_event" records stripped
 out — they are ~99% of the bytes and their text is already in the .log. The
@@ -200,14 +201,15 @@ Environment variables:
                         is treated as unparseable and the blind wait is used.
   EMAIL_LOG_LINES       Lines from the tail of the last step log to include
                         in the summary email (default: 40).
-  AUTOPILOT_ALLOW_NO_TMUX
-                        Set to 1 to run even when the run looks attached to
-                        a terminal and would die with it (default: 0,
-                        refuse). tmux, screen, nohup and setsid are all
-                        detected and need no override. Detection of nohup
-                        reads /proc, so on a system without it only the
-                        no-controlling-terminal case is recognized and this
-                        is the escape hatch.
+  AUTOPILOT_SKIP_DETACH_CHECK
+                        Set to 1 to skip every check that this run outlives
+                        your terminal (default: 0). Those checks refuse an
+                        attached run, a nohup writing to ./nohup.out, and a
+                        setsid still writing to the terminal it detached
+                        from. tmux, screen, nohup and setsid are detected
+                        automatically and need no override; nohup detection
+                        reads /proc, so on a system without it this is the
+                        escape hatch.
   AUTOPILOT_NO_RESUME   Set to 1 to refuse to start when an autopilot/*
                         step branch is checked out (default: 0, which picks
                         that interrupted step back up). A branch whose step
@@ -457,23 +459,61 @@ elif no_controlling_tty; then
   detach_mode="detached — no controlling terminal (setsid/cron)"
 fi
 
-if [[ -z "$detach_mode" ]]; then
-  if [[ "${AUTOPILOT_ALLOW_NO_TMUX:-0}" == "1" ]]; then
-    detach_mode="none — AUTOPILOT_ALLOW_NO_TMUX=1"
-    say "WARNING: this run looks attached to your terminal and will die with it. Continuing because AUTOPILOT_ALLOW_NO_TMUX=1."
-  else
-    say "ERROR: this run would die with your terminal (e.g. if your SSH session drops)."
-    say "Use any one of:"
-    say "  tmux new -s autopilot   — then re-run this script inside that session"
+# Where a standard stream actually points, which is what says whether the
+# launch command included its redirects.
+#
+# The streams are duplicated onto fds 8 and 9 first because the obvious
+# `$(readlink /proc/self/fd/1)` reads the *command substitution's* stdout — a
+# pipe — and never the script's own. The copies are inherited by the subshell
+# unchanged, so they still name the real targets.
+fd_target() { readlink "/proc/self/fd/$1" 2>/dev/null; }
+
+if [[ "${AUTOPILOT_SKIP_DETACH_CHECK:-0}" == "1" ]]; then
+  say "Skipping the terminal-survivability checks (AUTOPILOT_SKIP_DETACH_CHECK=1)."
+elif [[ -z "$detach_mode" ]]; then
+  say "ERROR: this run would die with your terminal (e.g. if your SSH session drops)."
+  say "Use any one of:"
+  say "  tmux new -s autopilot   — then re-run this script inside that session"
+  say "  nohup autopilot > /dev/null 2>&1 &"
+  say "  setsid autopilot > /dev/null 2>&1 &"
+  say "Logs are unaffected by the choice — every 'AP:' line goes to $LOG_DIR/autopilot-run.log:"
+  say "  tail -f $LOG_DIR/autopilot-run.log"
+  say "Set AUTOPILOT_SKIP_DETACH_CHECK=1 to run attached anyway."
+  exit 1
+else
+  # Surviving the terminal is only half of it: the streams have to land
+  # somewhere that outlives it too. Both failure modes below are launch
+  # commands missing their redirects, and both are silent until it's too late.
+  exec 9>&1 8>&2
+  out_fd="$(fd_target 9)"
+  err_fd="$(fd_target 8)"
+  exec 9>&- 8>&-
+
+  # nohup with stdout still on a tty quietly redirects it to ./nohup.out —
+  # inside the project root, where it fails the clean-tree check and stops the
+  # run before any step begins.
+  if [[ "$out_fd" == */nohup.out || "$err_fd" == */nohup.out ]]; then
+    say "ERROR: nohup is writing this run's output to ${out_fd:-$err_fd} because the launch command didn't redirect it."
+    say "That file lands in the project root and fails autopilot's clean-tree check. Redirect instead:"
     say "  nohup autopilot > /dev/null 2>&1 &"
+    say "Nothing is lost by discarding it — every 'AP:' line goes to $LOG_DIR/autopilot-run.log."
+    say "Delete the nohup.out that was just created, then re-run."
+    exit 1
+  fi
+
+  # setsid leaves stdout pointing at a terminal the run no longer belongs to.
+  # It works right up until you close that terminal, at which point every write
+  # fails and the whole terminal transcript is gone — the one case where a
+  # detached run looks fine and still loses its output.
+  if [[ "$detach_mode" == detached* ]] && { [[ -t 1 ]] || [[ -t 2 ]]; }; then
+    say "ERROR: this run is detached from your terminal but still writing to it, so its output dies when that terminal closes."
+    say "Redirect both streams:"
     say "  setsid autopilot > /dev/null 2>&1 &"
-    say "Logs are unaffected by the choice — every 'AP:' line goes to $LOG_DIR/autopilot-run.log:"
-    say "  tail -f $LOG_DIR/autopilot-run.log"
-    say "Set AUTOPILOT_ALLOW_NO_TMUX=1 to run attached anyway."
+    say "Nothing is lost by discarding them — every 'AP:' line goes to $LOG_DIR/autopilot-run.log."
     exit 1
   fi
 fi
-say "Detachment: $detach_mode."
+say "Detachment: ${detach_mode:-unchecked}."
 
 if [[ ! -f "$SKILL_INSTALL_PATH" ]]; then
   say "ERROR: $SKILL_INSTALL_PATH not found — that skill is what actually implements each step."

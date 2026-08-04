@@ -65,10 +65,17 @@ The choice costs nothing in logging. Every `AP:` line is appended to
 discarding stdout entirely — as above — loses nothing, and the file is
 complete even after the shell is gone.
 
-Redirect stdout as shown: without it, `nohup` drops a `nohup.out` in the
-project root, which then fails autopilot's clean-tree check. Running attached,
-where the run would die with the terminal, is refused unless you set
-`AUTOPILOT_ALLOW_NO_TMUX=1`.
+The redirects above are checked, not just advised. Autopilot refuses to start
+on any of three counts, each with the command to fix it:
+
+- the run is attached and would die with the terminal;
+- `nohup` is writing to `./nohup.out` because the launch command omitted its
+  redirect — that file lands in the project root and fails the clean-tree
+  check anyway;
+- `setsid` detached the run but left it writing to the terminal it left, which
+  works right up until you close that terminal.
+
+`AUTOPILOT_SKIP_DETACH_CHECK=1` skips all three.
 
 See `autopilot --help` for the full contract: how steps are picked, branched,
 verified and merged; usage-limit retry and resume behavior; log locations;
