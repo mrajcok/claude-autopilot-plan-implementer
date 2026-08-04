@@ -468,6 +468,19 @@ fi
 # unchanged, so they still name the real targets.
 fd_target() { readlink "/proc/self/fd/$1" 2>/dev/null; }
 
+# These particular errors are about output going somewhere you can't see, so
+# reporting them on stdout alone means `nohup autopilot` fails in what looks
+# like silence — the explanation sitting in the nohup.out it just warned about.
+# Mirrored to the controlling terminal when stdout isn't already it. Under
+# setsid there is no /dev/tty to reach, which is the case the run log covers.
+say_detach() {
+  say "$@"
+  if [[ ! -t 1 ]] && [[ -w /dev/tty ]]; then
+    echo "AP: $(date '+%Y-%m-%d %H:%M:%S') | $*" > /dev/tty 2>/dev/null
+  fi
+  return 0
+}
+
 if [[ "${AUTOPILOT_SKIP_DETACH_CHECK:-0}" == "1" ]]; then
   say "Skipping the terminal-survivability checks (AUTOPILOT_SKIP_DETACH_CHECK=1)."
 elif [[ -z "$detach_mode" ]]; then
@@ -493,11 +506,11 @@ else
   # inside the project root, where it fails the clean-tree check and stops the
   # run before any step begins.
   if [[ "$out_fd" == */nohup.out || "$err_fd" == */nohup.out ]]; then
-    say "ERROR: nohup is writing this run's output to ${out_fd:-$err_fd} because the launch command didn't redirect it."
-    say "That file lands in the project root and fails autopilot's clean-tree check. Redirect instead:"
-    say "  nohup autopilot > /dev/null 2>&1 &"
-    say "Nothing is lost by discarding it — every 'AP:' line goes to $LOG_DIR/autopilot-run.log."
-    say "Delete the nohup.out that was just created, then re-run."
+    say_detach "ERROR: nohup is writing this run's output to ${out_fd:-$err_fd} because the launch command didn't redirect it."
+    say_detach "That file lands in the project root and fails autopilot's clean-tree check. Redirect instead:"
+    say_detach "  nohup autopilot > /dev/null 2>&1 &"
+    say_detach "Nothing is lost by discarding it — every 'AP:' line goes to $LOG_DIR/autopilot-run.log."
+    say_detach "Delete the nohup.out that was just created, then re-run."
     exit 1
   fi
 
@@ -506,10 +519,10 @@ else
   # fails and the whole terminal transcript is gone — the one case where a
   # detached run looks fine and still loses its output.
   if [[ "$detach_mode" == detached* ]] && { [[ -t 1 ]] || [[ -t 2 ]]; }; then
-    say "ERROR: this run is detached from your terminal but still writing to it, so its output dies when that terminal closes."
-    say "Redirect both streams:"
-    say "  setsid autopilot > /dev/null 2>&1 &"
-    say "Nothing is lost by discarding them — every 'AP:' line goes to $LOG_DIR/autopilot-run.log."
+    say_detach "ERROR: this run is detached from your terminal but still writing to it, so its output dies when that terminal closes."
+    say_detach "Redirect both streams:"
+    say_detach "  setsid autopilot > /dev/null 2>&1 &"
+    say_detach "Nothing is lost by discarding them — every 'AP:' line goes to $LOG_DIR/autopilot-run.log."
     exit 1
   fi
 fi
