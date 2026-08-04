@@ -82,10 +82,16 @@ also appended to logs/autopilot-run.log — one file per project, across runs.
 That is the whole terminal transcript, so a detached run loses nothing when
 its terminal goes away, and it is the file to `tail -f` to follow a run.
 
-The run must outlive its terminal. tmux is the default way; to run detached
-without it, set AUTOPILOT_ALLOW_NO_TMUX=1 and use nohup:
-  AUTOPILOT_ALLOW_NO_TMUX=1 nohup autopilot > /dev/null 2>&1 &
+The run must outlive its terminal, but how is up to you — tmux, screen,
+nohup or setsid are all accepted, and detected automatically:
+  tmux new -s autopilot   # then run autopilot inside it
+  nohup autopilot > /dev/null 2>&1 &
+  setsid autopilot > /dev/null 2>&1 &
   tail -f logs/autopilot-run.log
+The choice costs nothing in logging: AP: lines are written to the run log
+directly, not by way of the terminal. Redirect stdout as shown — without it
+nohup drops a nohup.out in the project root, which fails the clean-tree
+check. Running attached is refused unless AUTOPILOT_ALLOW_NO_TMUX=1.
 
 The archived .raw.jsonl has the per-token "stream_event" records stripped
 out — they are ~99% of the bytes and their text is already in the .log. The
@@ -195,10 +201,13 @@ Environment variables:
   EMAIL_LOG_LINES       Lines from the tail of the last step log to include
                         in the summary email (default: 40).
   AUTOPILOT_ALLOW_NO_TMUX
-                        Set to 1 to run outside tmux (default: 0, refuse).
-                        The run still has to outlive its terminal — use
-                        nohup or setsid. logs/autopilot-run.log keeps the
-                        full transcript either way.
+                        Set to 1 to run even when the run looks attached to
+                        a terminal and would die with it (default: 0,
+                        refuse). tmux, screen, nohup and setsid are all
+                        detected and need no override. Detection of nohup
+                        reads /proc, so on a system without it only the
+                        no-controlling-terminal case is recognized and this
+                        is the escape hatch.
   AUTOPILOT_NO_RESUME   Set to 1 to refuse to start when an autopilot/*
                         step branch is checked out (default: 0, which picks
                         that interrupted step back up). A branch whose step
@@ -319,22 +328,6 @@ sleep_until() {
   done
 }
 
-# The requirement is that the run outlive the terminal, not tmux specifically.
-# nohup/setsid do that too, and are easier to page through afterwards — the run
-# log holds everything the terminal would have shown. Opting out is explicit so
-# that simply forgetting tmux still fails loudly.
-if [[ -z "${TMUX:-}" ]]; then
-  if [[ "${AUTOPILOT_ALLOW_NO_TMUX:-0}" == "1" ]]; then
-    say "Not inside tmux; running anyway (AUTOPILOT_ALLOW_NO_TMUX=1). Make sure this survives the terminal — e.g. 'nohup autopilot ... &'."
-  else
-    say "ERROR: not running inside tmux. If this shell dies (e.g. your SSH session drops), the run stops with it."
-    say "Either: tmux new -s autopilot   — then re-run this script inside that session."
-    say "Or, to run detached without tmux:"
-    say "  AUTOPILOT_ALLOW_NO_TMUX=1 nohup autopilot > /dev/null 2>&1 &"
-    say "  tail -f $LOG_DIR/autopilot-run.log"
-    exit 1
-  fi
-fi
 
 if ! command -v claude >/dev/null 2>&1; then
   say "ERROR: 'claude' is not on PATH. Install Claude Code, or start the shell that has it, then re-run."
@@ -427,6 +420,60 @@ RUN_LOG="$LOG_DIR/autopilot-run.log"
   echo
   echo "=== autopilot run started $(date '+%Y-%m-%d %H:%M:%S') (pid $$) in $PWD ==="
 } >> "$RUN_LOG"
+
+# The requirement is that the run outlive its terminal, not tmux specifically.
+# nohup and setsid both satisfy it, and neither costs any logging: every AP:
+# line is written to $RUN_LOG directly, so nothing depends on the terminal
+# still being there to receive stdout.
+#
+# nohup is recognized by the SIGHUP disposition it leaves behind (bit 0 of
+# SigIgn) rather than by any variable — that is the actual mechanism by which
+# the run survives, and a shell cannot re-trap a signal that was ignored on
+# entry, so this script's own HUP trap does not clear it.
+hup_ignored() {
+  local mask
+  mask=$(awk '/^SigIgn:/{print $2}' /proc/self/status 2>/dev/null) || return 1
+  [[ -n "$mask" ]] || return 1
+  (( (16#$mask & 1) == 1 ))
+}
+
+# setsid puts the run in a new session with no controlling terminal, so the
+# terminal's SIGHUP never reaches it. Also true of cron and CI runners, which
+# are just as safe.
+no_controlling_tty() {
+  local t
+  t=$(ps -o tty= -p $$ 2>/dev/null | tr -d '[:space:]')
+  [[ -z "$t" || "$t" == "?" || "$t" == "??" ]]
+}
+
+detach_mode=""
+if [[ -n "${TMUX:-}" ]]; then
+  detach_mode="tmux"
+elif [[ -n "${STY:-}" ]]; then
+  detach_mode="screen"
+elif hup_ignored; then
+  detach_mode="nohup (SIGHUP ignored)"
+elif no_controlling_tty; then
+  detach_mode="detached — no controlling terminal (setsid/cron)"
+fi
+
+if [[ -z "$detach_mode" ]]; then
+  if [[ "${AUTOPILOT_ALLOW_NO_TMUX:-0}" == "1" ]]; then
+    detach_mode="none — AUTOPILOT_ALLOW_NO_TMUX=1"
+    say "WARNING: this run looks attached to your terminal and will die with it. Continuing because AUTOPILOT_ALLOW_NO_TMUX=1."
+  else
+    say "ERROR: this run would die with your terminal (e.g. if your SSH session drops)."
+    say "Use any one of:"
+    say "  tmux new -s autopilot   — then re-run this script inside that session"
+    say "  nohup autopilot > /dev/null 2>&1 &"
+    say "  setsid autopilot > /dev/null 2>&1 &"
+    say "Logs are unaffected by the choice — every 'AP:' line goes to $LOG_DIR/autopilot-run.log:"
+    say "  tail -f $LOG_DIR/autopilot-run.log"
+    say "Set AUTOPILOT_ALLOW_NO_TMUX=1 to run attached anyway."
+    exit 1
+  fi
+fi
+say "Detachment: $detach_mode."
 
 if [[ ! -f "$SKILL_INSTALL_PATH" ]]; then
   say "ERROR: $SKILL_INSTALL_PATH not found — that skill is what actually implements each step."
@@ -569,6 +616,12 @@ fi
 # ride along into the first step's commit and get merged into the base branch.
 if [[ -n "$(git status --porcelain)" ]]; then
   say "ERROR: the working tree isn't clean. Autopilot commits with 'git add -A', so uncommitted work would be swept into a step's commit."
+  # `nohup autopilot &` with stdout still on a tty drops a nohup.out right
+  # here, which then fails this check — an error that reads like the user's own
+  # mess when it is really the launch command missing its redirect.
+  if [[ -e nohup.out ]] && ! git check-ignore -q nohup.out 2>/dev/null; then
+    say "NOTE: that includes nohup.out, which nohup created because stdout was still your terminal. Redirect it instead: nohup autopilot > /dev/null 2>&1 &  (the run log has everything anyway). Then delete nohup.out."
+  fi
   say "If you didn't leave these: a previous run may have stopped for review before its session got as far as branching, leaving the step's partial work here on '$BASE_BRANCH'. Check the newest logs/autopilot-step-*.log."
   say "Commit, stash, or discard your changes, then re-run. Current status:"
   git status --short

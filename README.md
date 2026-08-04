@@ -45,21 +45,30 @@ From any project's root directory (a git repo, with a plan file and ideally
 a `./run_tests.sh`):
 
 ```bash
-tmux new -s autopilot   # autopilot refuses to run outside tmux
+tmux new -s autopilot   # then run autopilot inside it
 autopilot
 ```
 
-A run has to outlive its terminal, but it doesn't have to be tmux. To run
-detached instead:
+A run has to outlive its terminal, but tmux isn't the only way. `screen`,
+`nohup` and `setsid` are all accepted and detected automatically:
 
 ```bash
-AUTOPILOT_ALLOW_NO_TMUX=1 nohup autopilot > /dev/null 2>&1 &
+nohup autopilot > /dev/null 2>&1 &
+# or
+setsid autopilot > /dev/null 2>&1 &
+
 tail -f logs/autopilot-run.log
 ```
 
-Everything the terminal would have shown is appended to
-`logs/autopilot-run.log`, so nothing is lost when the shell goes away —
-discarding stdout entirely, as above, costs you nothing.
+The choice costs nothing in logging. Every `AP:` line is appended to
+`logs/autopilot-run.log` directly rather than by way of the terminal, so
+discarding stdout entirely — as above — loses nothing, and the file is
+complete even after the shell is gone.
+
+Redirect stdout as shown: without it, `nohup` drops a `nohup.out` in the
+project root, which then fails autopilot's clean-tree check. Running attached,
+where the run would die with the terminal, is refused unless you set
+`AUTOPILOT_ALLOW_NO_TMUX=1`.
 
 See `autopilot --help` for the full contract: how steps are picked, branched,
 verified and merged; usage-limit retry and resume behavior; log locations;
